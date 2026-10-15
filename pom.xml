@@ -56,26 +56,27 @@
                 </configuration>
             </plugin>
 
-            <!-- Builds a standalone executable binary -->
+            <!-- Builds a standalone executable JAR -->
             <plugin>
-                <groupId>org.graalvm.buildtools</groupId>
-                <artifactId>native-maven-plugin</artifactId>
-                <version>1.1.14</version>
-                <extensions>true</extensions>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>3.3.0</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.cognitionbox.petra.lsp.PetraUniversalLSP</mainClass>
+                        </manifest>
+                    </archive>
+                    <descriptorRefs>
+                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                    </descriptorRefs>
+                </configuration>
                 <executions>
                     <execution>
-                        <id>build-native</id>
-                        <goals>
-                            <goal>build</goal>
-                        </goals>
                         <phase>package</phase>
+                        <goals><goal>single</goal></goals>
                     </execution>
                 </executions>
-                <configuration>
-                    <imageName>petra-lsp</imageName>
-                    <mainClass>com.cognitionbox.petra.lsp.PetraUniversalLSP</mainClass>
-                    <fallback>false</fallback>
-                </configuration>
             </plugin>
         </plugins>
     </build>

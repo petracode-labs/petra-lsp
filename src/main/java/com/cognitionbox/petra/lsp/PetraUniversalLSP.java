@@ -29,6 +29,7 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     }
 
     public static class UClass {
+        public boolean isExternal = false;
         public boolean hasInheritance = false;
         public final List<UField> fields = new ArrayList<>();
         public final List<UMethod> methods = new ArrayList<>();
@@ -187,6 +188,42 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
         return prog;
     }
 
+    private static boolean isExternalClass(ParseTree node, String sourceCode, Parser parser, LangSpec spec) {
+        // 1. Direct text check
+        String classText = extractSource(node, sourceCode);
+        if (classText.contains("@External")) return true;
+
+        // 2. Parent node check (e.g. typeDeclaration or decorated rule)
+        ParseTree parent = node.getParent();
+        if (parent instanceof RuleContext) {
+            String parentRule = parser.getRuleNames()[((RuleContext) parent).getRuleIndex()];
+            if (!parentRule.equalsIgnoreCase(spec.rootRule)) {
+                String parentText = extractSource(parent, sourceCode);
+                int cut = parentText.indexOf('{');
+                if (cut == -1) cut = parentText.indexOf(':');
+                String header = (cut != -1) ? parentText.substring(0, cut) : parentText;
+                if (header.contains("@External")) return true;
+            }
+        }
+
+        // 3. Raw buffer fallback: check code between previous statement delimiter (; or }) and this class
+        if (node instanceof ParserRuleContext) {
+            Token start = ((ParserRuleContext) node).getStart();
+            if (start != null) {
+                int startIdx = start.getStartIndex();
+                if (startIdx > 0 && startIdx <= sourceCode.length()) {
+                    int prevBoundary = Math.max(0, Math.max(
+                            sourceCode.lastIndexOf('}', startIdx - 1),
+                            sourceCode.lastIndexOf(';', startIdx - 1)
+                    ));
+                    String preamble = sourceCode.substring(prevBoundary, startIdx);
+                    if (preamble.contains("@External")) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static void walk(ParseTree node, UProgram prog, UClass currentClass, UMethod currentMethod, String sourceCode, LangSpec spec, Parser parser) {
         String type = "";
         if (node instanceof RuleContext) {
@@ -195,32 +232,38 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
 
         if (spec.classNodes.contains(type)) {
             currentClass = new UClass(range(node));
+            currentClass.isExternal = isExternalClass(node, sourceCode, parser, spec);
             prog.classes.add(currentClass);
 
-            String classText = extractSource(node, sourceCode);
-            if (spec.lexerClass.contains("Python")) {
-                int colonIdx = classText.indexOf(':');
-                String pyHeader = (colonIdx != -1) ? classText.substring(0, colonIdx) : classText;
-                Matcher pyExt = Pattern.compile("\\(([^)]+)\\)").matcher(pyHeader);
-                if (pyExt.find() && !pyExt.group(1).trim().isEmpty()) {
-                    currentClass.hasInheritance = true;
-                }
-            } else {
-                int braceIdx = classText.indexOf('{');
-                String header = (braceIdx != -1) ? classText.substring(0, braceIdx) : classText;
-                if (Pattern.compile("\\bextends\\b").matcher(header).find()
-                        || Pattern.compile(":\\s*(public|private|protected)?\\s*\\w+").matcher(header).find()) {
-                    currentClass.hasInheritance = true;
+            if (!currentClass.isExternal) {
+                String classText = extractSource(node, sourceCode);
+                if (spec.lexerClass.contains("Python")) {
+                    int colonIdx = classText.indexOf(':');
+                    String pyHeader = (colonIdx != -1) ? classText.substring(0, colonIdx) : classText;
+                    Matcher pyExt = Pattern.compile("\\(([^)]+)\\)").matcher(pyHeader);
+                    if (pyExt.find() && !pyExt.group(1).trim().isEmpty()) {
+                        currentClass.hasInheritance = true;
+                    }
+                } else {
+                    int braceIdx = classText.indexOf('{');
+                    String header = (braceIdx != -1) ? classText.substring(0, braceIdx) : classText;
+                    if (Pattern.compile("\\bextends\\b").matcher(header).find()
+                            || Pattern.compile(":\\s*(public|private|protected)?\\s*\\w+").matcher(header).find()) {
+                        currentClass.hasInheritance = true;
+                    }
                 }
             }
         }
-        else if (currentClass != null && spec.fieldNodes.contains(type)) {
+        else if (currentClass != null && !currentClass.isExternal && spec.fieldNodes.contains(type)) {
             UField field = new UField(range(node));
+            String text = extractSource(node, sourceCode);
+            String typeStr = extractTypeStr(node, parser, sourceCode);
+
             field.isFinal = hasModifier(node, sourceCode, parser, spec, "final", "const", "readonly", "Final");
-            field.isPrimitive = isPrimitiveType(extractTypeStr(node, parser, sourceCode));
+            field.isPrimitive = isPrimitiveType(typeStr) || text.contains("@Enum");
             currentClass.fields.add(field);
         }
-        else if (currentClass != null && spec.methodNodes.contains(type)) {
+        else if (currentClass != null && !currentClass.isExternal && spec.methodNodes.contains(type)) {
             currentMethod = new UMethod(range(node));
             String text = extractSource(node, sourceCode);
 
@@ -236,10 +279,11 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 currentMethod.hasParams = false;
             }
 
-            currentMethod.returnsPrimitive = isPrimitiveType(extractTypeStr(node, parser, sourceCode));
+            String typeStr = extractTypeStr(node, parser, sourceCode);
+            currentMethod.returnsPrimitive = isPrimitiveType(typeStr) || text.contains("@Enum");
             currentClass.methods.add(currentMethod);
         }
-        else if (currentMethod != null) {
+        else if (currentMethod != null && (currentClass == null || !currentClass.isExternal)) {
             if (spec.loopNodes.contains(type)) currentMethod.hasLoops = true;
             if (spec.exceptionNodes.contains(type)) currentMethod.hasExceptions = true;
             if (spec.switchNodes.contains(type)) currentMethod.hasSwitch = true;
@@ -247,8 +291,11 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
 
             if (spec.varNodes.contains(type)) {
                 UVar var = new UVar(range(node));
+                String text = extractSource(node, sourceCode);
                 String typeStr = extractTypeStr(node, parser, sourceCode);
-                var.isPrimitive = isPrimitiveType(typeStr);
+
+                var.isPrimitive = isPrimitiveType(typeStr) || text.contains("@Enum");
+
                 if (typeStr.isEmpty() || typeStr.equals("var") || typeStr.equals("auto")) {
                     currentMethod.hasUntyped = true;
                 }
@@ -282,6 +329,9 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     private static boolean isPrimitiveType(String typeStr) {
         if (typeStr == null || typeStr.isEmpty() || typeStr.equalsIgnoreCase("void")) return true;
         String clean = typeStr.replaceAll("@\\w+\\s*", "").trim();
+
+        if (clean.endsWith("Enum")) return true;
+
         if (clean.equalsIgnoreCase("int") || clean.equalsIgnoreCase("long")
                 || clean.equalsIgnoreCase("double") || clean.equalsIgnoreCase("float")
                 || clean.equalsIgnoreCase("boolean") || clean.equalsIgnoreCase("bool")
@@ -377,6 +427,9 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
             boolean coordFailed = false;
 
             for (UClass uClass : program.classes) {
+                // Skip entirely if annotated with @External
+                if (uClass.isExternal) continue;
+
                 if (uClass.hasInheritance) {
                     baseFailed = true;
                     diagnostics.add(createDiag(uClass.range, "Petra Base: Inheritance is strictly forbidden. Use interfaces."));

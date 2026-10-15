@@ -13,8 +13,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Universal Petra Coord & Base Language Server (Pure Java ANTLR 4 Edition).
- * Validates Petra Base and Petra Coord subset constraints across multiple languages.
+ - Universal Petra Coord & Base Language Server (Pure Java ANTLR 4 Edition).
+
+ - Validates Petra Base and Petra Coord subset constraints across multiple languages.
+
  */
 public class PetraUniversalLSP implements LanguageServer, TextDocumentService, WorkspaceService, LanguageClientAware {
 
@@ -59,6 +61,7 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
 
     public static class UVar {
         public boolean isPrimitive = false;
+        public boolean isFinal = false;
         public Range range;
         public UVar(Range range) { this.range = range; }
     }
@@ -72,9 +75,16 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
         public final Set<String> classNodes, extendsNodes, methodNodes, fieldNodes,
                 varNodes, loopNodes, exceptionNodes, switchNodes, untypedNodes;
 
+        // Language-specific semantic rules
+        public final Set<String> finalKeywords;
+        public final String externalMarker;
+        public final String enumMarker;
+        public final boolean isFinalByDefault;
+
         public LangSpec(String lexerClass, String parserClass, String rootRule,
                         String[] cls, String[] ext, String[] meth, String[] fld,
-                        String[] var, String[] loop, String[] exc, String[] sw, String[] untyped) {
+                        String[] var, String[] loop, String[] exc, String[] sw, String[] untyped,
+                        String[] finalKeywords, String externalMarker, String enumMarker, boolean isFinalByDefault) {
             this.lexerClass = lexerClass; this.parserClass = parserClass; this.rootRule = rootRule;
             this.classNodes = new HashSet<>(Arrays.asList(cls));
             this.extendsNodes = new HashSet<>(Arrays.asList(ext));
@@ -85,6 +95,11 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
             this.exceptionNodes = new HashSet<>(Arrays.asList(exc));
             this.switchNodes = new HashSet<>(Arrays.asList(sw));
             this.untypedNodes = new HashSet<>(Arrays.asList(untyped));
+
+            this.finalKeywords = new HashSet<>(Arrays.asList(finalKeywords));
+            this.externalMarker = externalMarker;
+            this.enumMarker = enumMarker;
+            this.isFinalByDefault = isFinalByDefault;
         }
     }
 
@@ -98,7 +113,8 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 new String[]{"localVariableDeclaration", "formalParameter"},
                 new String[]{"whileStatement", "forStatement", "doStatement"},
                 new String[]{"throwStatement", "tryStatement"}, new String[]{"switchStatement"},
-                new String[]{"var"}
+                new String[]{"var"},
+                new String[]{"final"}, "@External", "@Enum", false
         ));
 
         SPECS.put(".py", new LangSpec(
@@ -108,7 +124,8 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 new String[]{"parameters", "expr_stmt"},
                 new String[]{"while_stmt", "for_stmt"},
                 new String[]{"raise_stmt", "try_stmt"}, new String[]{"match_stmt"},
-                new String[]{}
+                new String[]{},
+                new String[]{}, "@External", "@Enum", false
         ));
 
         SPECS.put(".ts", new LangSpec(
@@ -118,7 +135,8 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 new String[]{"variableDeclaration", "requiredParameter"},
                 new String[]{"whileStatement", "forStatement", "doStatement"},
                 new String[]{"throwStatement", "tryStatement"}, new String[]{"switchStatement"},
-                new String[]{}
+                new String[]{},
+                new String[]{"readonly", "const"}, "@External", "@Enum", false
         ));
 
         SPECS.put(".cpp", new LangSpec(
@@ -128,7 +146,8 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 new String[]{"simpleDeclaration", "parameterDeclaration"},
                 new String[]{"iterationStatement"},
                 new String[]{"tryBlock", "throwExpression"}, new String[]{"selectionStatement"},
-                new String[]{"auto"}
+                new String[]{"auto"},
+                new String[]{"const"}, "PETRA_EXTERNAL", "PETRA_ENUM", false
         ));
 
         SPECS.put(".go", new LangSpec(
@@ -138,7 +157,8 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 new String[]{"varDecl", "parameterDecl"},
                 new String[]{"forStmt"},
                 new String[]{"deferStmt"}, new String[]{"switchStmt", "typeSwitchStmt"},
-                new String[]{"shortVarDecl"}
+                new String[]{"shortVarDecl"},
+                new String[]{}, "//petra:external", "//petra:enum", false
         ));
 
         SPECS.put(".rs", new LangSpec(
@@ -148,7 +168,8 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 new String[]{"letDeclaration", "functionParam"},
                 new String[]{"whileExpression", "loopExpression", "forExpression"},
                 new String[]{}, new String[]{"matchExpression"},
-                new String[]{}
+                new String[]{},
+                new String[]{"mut"}, "#[petra::external]", "#[petra::enum]", true
         ));
     }
 
@@ -189,9 +210,13 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     }
 
     private static boolean isExternalClass(ParseTree node, String sourceCode, Parser parser, LangSpec spec) {
-        // 1. Direct text check
+        // 1. Direct text check using language-specific marker (RESTRICTED TO HEADER ONLY)
         String classText = extractSource(node, sourceCode);
-        if (classText.contains("@External")) return true;
+        int bodyStart = classText.indexOf('{');
+        if (bodyStart == -1) bodyStart = classText.indexOf(':');
+        String header = bodyStart != -1 ? classText.substring(0, bodyStart) : classText;
+
+        if (header.contains(spec.externalMarker)) return true;
 
         // 2. Parent node check (e.g. typeDeclaration or decorated rule)
         ParseTree parent = node.getParent();
@@ -201,12 +226,12 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 String parentText = extractSource(parent, sourceCode);
                 int cut = parentText.indexOf('{');
                 if (cut == -1) cut = parentText.indexOf(':');
-                String header = (cut != -1) ? parentText.substring(0, cut) : parentText;
-                if (header.contains("@External")) return true;
+                String parentHeader = (cut != -1) ? parentText.substring(0, cut) : parentText;
+                if (parentHeader.contains(spec.externalMarker)) return true;
             }
         }
 
-        // 3. Raw buffer fallback: check code between previous statement delimiter (; or }) and this class
+        // 3. Raw buffer fallback
         if (node instanceof ParserRuleContext) {
             Token start = ((ParserRuleContext) node).getStart();
             if (start != null) {
@@ -217,7 +242,7 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                             sourceCode.lastIndexOf(';', startIdx - 1)
                     ));
                     String preamble = sourceCode.substring(prevBoundary, startIdx);
-                    if (preamble.contains("@External")) return true;
+                    if (preamble.contains(spec.externalMarker)) return true;
                 }
             }
         }
@@ -259,8 +284,13 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
             String text = extractSource(node, sourceCode);
             String typeStr = extractTypeStr(node, parser, sourceCode);
 
-            field.isFinal = hasModifier(node, sourceCode, parser, spec, "final", "const", "readonly", "Final");
-            field.isPrimitive = isPrimitiveType(typeStr) || text.contains("@Enum");
+            boolean hasKeyword = hasModifier(node, sourceCode, parser, spec, spec.finalKeywords.toArray(new String[0]));
+            field.isFinal = spec.isFinalByDefault ? !hasKeyword : hasKeyword;
+
+            // Unified Regex Enum Inference: Matches Java/TS/Python `State.WAITING` and Rust/C++ `State::WAITING`
+            boolean looksLikeEnumAssignment = Pattern.compile("=\\s*[A-Z]\\w*(?:\\.|::)[A-Z_0-9]+").matcher(text).find();
+            field.isPrimitive = isPrimitiveType(typeStr) || text.contains(spec.enumMarker) || looksLikeEnumAssignment;
+
             currentClass.fields.add(field);
         }
         else if (currentClass != null && !currentClass.isExternal && spec.methodNodes.contains(type)) {
@@ -280,7 +310,7 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
             }
 
             String typeStr = extractTypeStr(node, parser, sourceCode);
-            currentMethod.returnsPrimitive = isPrimitiveType(typeStr) || text.contains("@Enum");
+            currentMethod.returnsPrimitive = isPrimitiveType(typeStr) || text.contains(spec.enumMarker);
             currentClass.methods.add(currentMethod);
         }
         else if (currentMethod != null && (currentClass == null || !currentClass.isExternal)) {
@@ -294,9 +324,14 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 String text = extractSource(node, sourceCode);
                 String typeStr = extractTypeStr(node, parser, sourceCode);
 
-                var.isPrimitive = isPrimitiveType(typeStr) || text.contains("@Enum");
+                boolean hasKeyword = hasModifier(node, sourceCode, parser, spec, spec.finalKeywords.toArray(new String[0]));
+                var.isFinal = spec.isFinalByDefault ? !hasKeyword : hasKeyword;
 
-                if (typeStr.isEmpty() || typeStr.equals("var") || typeStr.equals("auto")) {
+                // Unified Regex Enum Inference
+                boolean looksLikeEnumAssignment = Pattern.compile("=\\s*[A-Z]\\w*(?:\\.|::)[A-Z_0-9]+").matcher(text).find();
+                var.isPrimitive = isPrimitiveType(typeStr) || text.contains(spec.enumMarker) || looksLikeEnumAssignment;
+
+                if (typeStr.equals("UnknownType") || typeStr.equals("var") || typeStr.equals("auto")) {
                     currentMethod.hasUntyped = true;
                 }
                 currentMethod.locals.add(var);
@@ -310,8 +345,11 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
 
     private static String extractTypeStr(ParseTree node, Parser parser, String sourceCode) {
         ParseTree typeNode = findChildRuleContaining(node, parser, "type");
-        if (typeNode != null) return extractSource(typeNode, sourceCode).trim();
-        return "";
+        if (typeNode != null) {
+            String extracted = extractSource(typeNode, sourceCode).trim();
+            if (!extracted.isEmpty()) return extracted;
+        }
+        return "UnknownType";
     }
 
     private static ParseTree findChildRuleContaining(ParseTree node, Parser parser, String keyword) {
@@ -327,9 +365,12 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     }
 
     private static boolean isPrimitiveType(String typeStr) {
-        if (typeStr == null || typeStr.isEmpty() || typeStr.equalsIgnoreCase("void")) return true;
-        String clean = typeStr.replaceAll("@\\w+\\s*", "").trim();
+        if (typeStr == null || typeStr.trim().isEmpty() || typeStr.equals("UnknownType")) {
+            return false;
+        }
+        if (typeStr.equalsIgnoreCase("void")) return true;
 
+        String clean = typeStr.replaceAll("@\\w+\\s*", "").trim();
         if (clean.endsWith("Enum")) return true;
 
         if (clean.equalsIgnoreCase("int") || clean.equalsIgnoreCase("long")
@@ -340,10 +381,13 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 || clean.equalsIgnoreCase("string") || clean.equalsIgnoreCase("str")) {
             return true;
         }
+
         return Pattern.matches("^[a-z].*", clean) && !clean.contains("[") && !clean.contains("<");
     }
 
     private static boolean hasModifier(ParseTree node, String sourceCode, Parser parser, LangSpec spec, String... modifiers) {
+        if (modifiers == null || modifiers.length == 0) return false;
+
         ParseTree target = node;
         while (target != null) {
             if (target instanceof RuleContext) {
@@ -405,7 +449,7 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     // =========================================================================
 
     private void validateDocument(String uri, String sourceCode) {
-        // NEW: Skip validation completely for test files
+        // Skip validation completely for test files
         if (isTestFile(uri)) {
             client.publishDiagnostics(new PublishDiagnosticsParams(uri, Collections.emptyList()));
             return;
@@ -433,7 +477,7 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
             boolean coordFailed = false;
 
             for (UClass uClass : program.classes) {
-                // Skip entirely if annotated with @External
+                // Skip entirely if annotated with external marker
                 if (uClass.isExternal) continue;
 
                 if (uClass.hasInheritance) {
@@ -456,9 +500,10 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                     if (m.isEntry && m.hasParams) { baseFailed = true; diagnostics.add(createDiag(m.range, "Petra Base: Entry points must have 0 parameters.")); }
 
                     for (UVar v : m.locals) {
-                        if (!v.isPrimitive) {
+                        // Allow object references locally, as long as they are final
+                        if (!v.isPrimitive && !v.isFinal) {
                             baseFailed = true;
-                            diagnostics.add(createDiag(v.range, "Petra Base: Local variables and parameters can only be primitives."));
+                            diagnostics.add(createDiag(v.range, "Petra Base: Local variables and parameters must be primitives or strictly final object references."));
                         }
                     }
 

@@ -405,6 +405,12 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     // =========================================================================
 
     private void validateDocument(String uri, String sourceCode) {
+        // NEW: Skip validation completely for test files
+        if (isTestFile(uri)) {
+            client.publishDiagnostics(new PublishDiagnosticsParams(uri, Collections.emptyList()));
+            return;
+        }
+
         String ext = getExtension(uri);
         if (!SPECS.containsKey(ext)) return;
 
@@ -534,5 +540,27 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     private String getExtension(String uri) {
         int dotIndex = uri.lastIndexOf('.');
         return dotIndex == -1 ? "" : uri.substring(dotIndex).toLowerCase();
+    }
+
+    private boolean isTestFile(String uri) {
+        if (uri == null) return false;
+        String lowerUri = uri.toLowerCase();
+
+        // 1. Directory-based heuristics (Maven/Gradle, Python, JS/TS)
+        if (lowerUri.contains("/src/test/") ||
+                lowerUri.contains("/tests/") ||
+                lowerUri.contains("/__tests__/")) {
+            return true;
+        }
+
+        // 2. File-name-based heuristics
+        if (lowerUri.endsWith("test.java") || lowerUri.endsWith("tests.java") ||
+                lowerUri.endsWith("_test.go") || lowerUri.endsWith("_test.py") ||
+                lowerUri.endsWith("_test.cpp") || lowerUri.endsWith("_test.rs") ||
+                lowerUri.contains(".test.") || lowerUri.contains(".spec.")) {
+            return true;
+        }
+
+        return false;
     }
 }

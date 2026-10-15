@@ -13,10 +13,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- - Universal Petra Coord & Base Language Server (Pure Java ANTLR 4 Edition).
-
- - Validates Petra Base and Petra Coord subset constraints across multiple languages.
-
+ * Universal Petra Coord & Base Language Server (Pure Java ANTLR 4 Edition).
+ *
+ * Validates Petra Base, Petra Coord, and Petra Coord+Base subset constraints across multiple languages.
+ * Annotations (@Base, @Coord) strictly drive the validation subsets.
  */
 public class PetraUniversalLSP implements LanguageServer, TextDocumentService, WorkspaceService, LanguageClientAware {
 
@@ -32,6 +32,8 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
 
     public static class UClass {
         public boolean isExternal = false;
+        public boolean isBase = false;
+        public boolean isCoord = false;
         public boolean hasInheritance = false;
         public final List<UField> fields = new ArrayList<>();
         public final List<UMethod> methods = new ArrayList<>();
@@ -47,9 +49,16 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     }
 
     public static class UMethod {
+        public boolean isExternal = false;
+        public boolean isBase = false;
+        public boolean isCoord = false;
+        public boolean isPublic = false;
         public boolean isEntry = false;
         public boolean hasParams = false;
         public boolean returnsPrimitive = true;
+        public boolean returnsBoolean = false;
+        public boolean returnsVoid = false;
+        public boolean hasAssert = false;
         public boolean hasLoops = false;
         public boolean hasExceptions = false;
         public boolean hasSwitch = false;
@@ -75,7 +84,6 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
         public final Set<String> classNodes, extendsNodes, methodNodes, fieldNodes,
                 varNodes, loopNodes, exceptionNodes, switchNodes, untypedNodes;
 
-        // Language-specific semantic rules
         public final Set<String> finalKeywords;
         public final String externalMarker;
         public final String enumMarker;
@@ -209,40 +217,38 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
         return prog;
     }
 
-    private static boolean isExternalClass(ParseTree node, String sourceCode, Parser parser, LangSpec spec) {
-        // 1. Direct text check using language-specific marker (RESTRICTED TO HEADER ONLY)
-        String classText = extractSource(node, sourceCode);
-        int bodyStart = classText.indexOf('{');
-        if (bodyStart == -1) bodyStart = classText.indexOf(':');
-        String header = bodyStart != -1 ? classText.substring(0, bodyStart) : classText;
+    // Extremely robust annotation detector. Checks the node, parent node, and raw preceding text buffer.
+    private static boolean hasAnnotation(ParseTree node, String sourceCode, Parser parser, LangSpec spec, String annotation) {
+        if (annotation == null || annotation.isEmpty()) return false;
 
-        if (header.contains(spec.externalMarker)) return true;
+        String text = extractSource(node, sourceCode);
+        int braceIdx = text.indexOf('{');
+        if (braceIdx == -1) braceIdx = text.indexOf(':');
+        String header = (braceIdx != -1) ? text.substring(0, braceIdx) : text;
+        if (header.contains(annotation)) return true;
 
-        // 2. Parent node check (e.g. typeDeclaration or decorated rule)
         ParseTree parent = node.getParent();
-        if (parent instanceof RuleContext) {
-            String parentRule = parser.getRuleNames()[((RuleContext) parent).getRuleIndex()];
-            if (!parentRule.equalsIgnoreCase(spec.rootRule)) {
-                String parentText = extractSource(parent, sourceCode);
-                int cut = parentText.indexOf('{');
-                if (cut == -1) cut = parentText.indexOf(':');
-                String parentHeader = (cut != -1) ? parentText.substring(0, cut) : parentText;
-                if (parentHeader.contains(spec.externalMarker)) return true;
-            }
+        if (parent != null) {
+            String parentText = extractSource(parent, sourceCode);
+            int parentBraceIdx = parentText.indexOf('{');
+            if (parentBraceIdx == -1) parentBraceIdx = parentText.indexOf(':');
+            String parentHeader = (parentBraceIdx != -1) ? parentText.substring(0, parentBraceIdx) : parentText;
+            if (parentHeader.contains(annotation)) return true;
         }
 
-        // 3. Raw buffer fallback
         if (node instanceof ParserRuleContext) {
             Token start = ((ParserRuleContext) node).getStart();
             if (start != null) {
                 int startIdx = start.getStartIndex();
                 if (startIdx > 0 && startIdx <= sourceCode.length()) {
-                    int prevBoundary = Math.max(0, Math.max(
-                            sourceCode.lastIndexOf('}', startIdx - 1),
-                            sourceCode.lastIndexOf(';', startIdx - 1)
-                    ));
+                    int i1 = sourceCode.lastIndexOf('}', startIdx - 1);
+                    int i2 = sourceCode.lastIndexOf(';', startIdx - 1);
+                    int i3 = sourceCode.lastIndexOf('{', startIdx - 1);
+                    int prevBoundary = Math.max(Math.max(i1, i2), i3);
+                    if (prevBoundary < 0) prevBoundary = 0;
+
                     String preamble = sourceCode.substring(prevBoundary, startIdx);
-                    if (preamble.contains(spec.externalMarker)) return true;
+                    if (preamble.contains(annotation)) return true;
                 }
             }
         }
@@ -257,7 +263,10 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
 
         if (spec.classNodes.contains(type)) {
             currentClass = new UClass(range(node));
-            currentClass.isExternal = isExternalClass(node, sourceCode, parser, spec);
+            currentClass.isExternal = hasAnnotation(node, sourceCode, parser, spec, spec.externalMarker);
+            currentClass.isBase = hasAnnotation(node, sourceCode, parser, spec, "@Base");
+            currentClass.isCoord = hasAnnotation(node, sourceCode, parser, spec, "@Coord");
+
             prog.classes.add(currentClass);
 
             if (!currentClass.isExternal) {
@@ -271,9 +280,11 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                     }
                 } else {
                     int braceIdx = classText.indexOf('{');
-                    String header = (braceIdx != -1) ? classText.substring(0, braceIdx) : classText;
-                    if (Pattern.compile("\\bextends\\b").matcher(header).find()
-                            || Pattern.compile(":\\s*(public|private|protected)?\\s*\\w+").matcher(header).find()) {
+                    if (braceIdx == -1) braceIdx = classText.indexOf(':');
+                    String classHeader = (braceIdx != -1) ? classText.substring(0, braceIdx) : classText;
+
+                    if (Pattern.compile("\\bextends\\b").matcher(classHeader).find()
+                            || Pattern.compile(":\\s*(public|private|protected)?\\s*\\w+").matcher(classHeader).find()) {
                         currentClass.hasInheritance = true;
                     }
                 }
@@ -287,7 +298,6 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
             boolean hasKeyword = hasModifier(node, sourceCode, parser, spec, spec.finalKeywords.toArray(new String[0]));
             field.isFinal = spec.isFinalByDefault ? !hasKeyword : hasKeyword;
 
-            // Unified Regex Enum Inference: Matches Java/TS/Python `State.WAITING` and Rust/C++ `State::WAITING`
             boolean looksLikeEnumAssignment = Pattern.compile("=\\s*[A-Z]\\w*(?:\\.|::)[A-Z_0-9]+").matcher(text).find();
             field.isPrimitive = isPrimitiveType(typeStr) || text.contains(spec.enumMarker) || looksLikeEnumAssignment;
 
@@ -297,10 +307,16 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
             currentMethod = new UMethod(range(node));
             String text = extractSource(node, sourceCode);
 
-            currentMethod.isEntry = text.contains("@Entry") || Pattern.compile("\\bmain\\s*\\(").matcher(text).find();
-
             int braceIndex = text.indexOf('{');
             String header = (braceIndex != -1) ? text.substring(0, braceIndex) : text;
+
+            currentMethod.isExternal = hasAnnotation(node, sourceCode, parser, spec, spec.externalMarker);
+            currentMethod.isBase = hasAnnotation(node, sourceCode, parser, spec, "@Base") || (currentClass != null && currentClass.isBase);
+            currentMethod.isCoord = hasAnnotation(node, sourceCode, parser, spec, "@Coord") || (currentClass != null && currentClass.isCoord);
+
+            currentMethod.isPublic = hasModifier(node, sourceCode, parser, spec, "public", "pub");
+            currentMethod.isEntry = text.contains("@Entry") || Pattern.compile("\\bmain\\s*\\(").matcher(text).find();
+
             Matcher paramMatcher = Pattern.compile("\\(([^)]*)\\)", Pattern.DOTALL).matcher(header);
             if (paramMatcher.find()) {
                 String params = paramMatcher.group(1).trim();
@@ -311,9 +327,14 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
 
             String typeStr = extractTypeStr(node, parser, sourceCode);
             currentMethod.returnsPrimitive = isPrimitiveType(typeStr) || text.contains(spec.enumMarker);
+            currentMethod.returnsBoolean = typeStr.equalsIgnoreCase("boolean") || typeStr.equalsIgnoreCase("bool");
+            currentMethod.returnsVoid = typeStr.equalsIgnoreCase("void");
+
+            currentMethod.hasAssert = Pattern.compile("\\bassert\\b").matcher(text).find();
+
             currentClass.methods.add(currentMethod);
         }
-        else if (currentMethod != null && (currentClass == null || !currentClass.isExternal)) {
+        else if (currentMethod != null && (currentClass == null || !currentClass.isExternal) && !currentMethod.isExternal) {
             if (spec.loopNodes.contains(type)) currentMethod.hasLoops = true;
             if (spec.exceptionNodes.contains(type)) currentMethod.hasExceptions = true;
             if (spec.switchNodes.contains(type)) currentMethod.hasSwitch = true;
@@ -327,7 +348,6 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 boolean hasKeyword = hasModifier(node, sourceCode, parser, spec, spec.finalKeywords.toArray(new String[0]));
                 var.isFinal = spec.isFinalByDefault ? !hasKeyword : hasKeyword;
 
-                // Unified Regex Enum Inference
                 boolean looksLikeEnumAssignment = Pattern.compile("=\\s*[A-Z]\\w*(?:\\.|::)[A-Z_0-9]+").matcher(text).find();
                 var.isPrimitive = isPrimitiveType(typeStr) || text.contains(spec.enumMarker) || looksLikeEnumAssignment;
 
@@ -394,7 +414,6 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
                 String rawRule = parser.getRuleNames()[((RuleContext) target).getRuleIndex()];
                 String lowerRule = rawRule.toLowerCase();
 
-                // Stop ascending once reaching the enclosing class body boundary, class node, or root
                 if (lowerRule.equals("classbody")
                         || lowerRule.equals("memberspecification")
                         || spec.classNodes.contains(rawRule)
@@ -449,7 +468,6 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
     // =========================================================================
 
     private void validateDocument(String uri, String sourceCode) {
-        // Skip validation completely for test files
         if (isTestFile(uri)) {
             client.publishDiagnostics(new PublishDiagnosticsParams(uri, Collections.emptyList()));
             return;
@@ -473,53 +491,111 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
         try {
             UProgram program = mapToUAST(parseResult.root, sourceCode, spec, parseResult.parser);
 
+            boolean isAnyBase = false;
+            boolean isAnyCoord = false;
             boolean baseFailed = false;
             boolean coordFailed = false;
 
             for (UClass uClass : program.classes) {
-                // Skip entirely if annotated with external marker
                 if (uClass.isExternal) continue;
 
-                if (uClass.hasInheritance) {
-                    baseFailed = true;
-                    diagnostics.add(createDiag(uClass.range, "Petra Base: Inheritance is strictly forbidden. Use interfaces."));
-                }
+                if (uClass.isBase) isAnyBase = true;
+                if (uClass.isCoord) isAnyCoord = true;
 
-                for (UField f : uClass.fields) {
-                    if (!f.isPrimitive && !f.isFinal) {
+                if (uClass.isBase) {
+                    if (uClass.hasInheritance) {
                         baseFailed = true;
-                        diagnostics.add(createDiag(f.range, "Petra Base: Object references must be strictly final."));
+                        diagnostics.add(createDiag(uClass.range, "Petra Base: Inheritance is strictly forbidden. Use interfaces."));
+                    }
+
+                    for (UField f : uClass.fields) {
+                        if (!f.isPrimitive && !f.isFinal) {
+                            baseFailed = true;
+                            diagnostics.add(createDiag(f.range, "Petra Base: Object references must be strictly final."));
+                        }
                     }
                 }
 
                 for (UMethod m : uClass.methods) {
-                    if (m.hasExceptions) { baseFailed = true; diagnostics.add(createDiag(m.range, "Petra Base: Exceptions are forbidden.")); }
-                    if (m.hasSwitch) { baseFailed = true; diagnostics.add(createDiag(m.range, "Petra Base: Switch blocks are forbidden. Use if-else.")); }
-                    if (m.hasUntyped) { baseFailed = true; diagnostics.add(createDiag(m.range, "Petra Base: Explicit types required. Type inference is forbidden.")); }
-                    if (!m.returnsPrimitive) { baseFailed = true; diagnostics.add(createDiag(m.range, "Petra Base: Methods can only return primitives or void.")); }
-                    if (m.isEntry && m.hasParams) { baseFailed = true; diagnostics.add(createDiag(m.range, "Petra Base: Entry points must have 0 parameters.")); }
+                    if (m.isExternal) continue;
 
-                    for (UVar v : m.locals) {
-                        // Allow object references locally, as long as they are final
-                        if (!v.isPrimitive && !v.isFinal) {
-                            baseFailed = true;
-                            diagnostics.add(createDiag(v.range, "Petra Base: Local variables and parameters must be primitives or strictly final object references."));
+                    if (m.isBase) isAnyBase = true;
+                    if (m.isCoord) isAnyCoord = true;
+
+                    // =========================================================
+                    // THE WEAVING LOGIC
+                    // If a method is BOTH @Coord and @Base, it passes through
+                    // BOTH blocks below. The stricter structural rules of @Coord
+                    // (no-args, boolean/void) intersect with the strict state/memory
+                    // rules of @Base (no exceptions, final refs) creating a union.
+                    // =========================================================
+
+                    // 1. @COORD SPECIFIC RULES (Command/Expression Structure)
+                    if (m.isCoord) {
+                        if (!m.isPublic) {
+                            coordFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Coord: Methods must be strictly public."));
+                        }
+                        if (m.hasParams) {
+                            coordFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Coord: Methods must have 0 parameters (zero-arg methods only)."));
+                        }
+                        if (!m.returnsBoolean && !m.returnsVoid) {
+                            coordFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Coord: Methods must strictly return boolean (Expression) or void (Command)."));
+                        }
+                        if (m.returnsVoid && !m.hasAssert) {
+                            coordFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Coord: Command methods (void) must conclude with an assert verifying post-conditions."));
+                        }
+                        if (m.hasSwitch) {
+                            coordFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Coord: Switch blocks are forbidden. Use strict if-then structures."));
+                        }
+                        if (m.hasLoops) {
+                            coordFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Coord: Raw while/for loops are forbidden. Use sep/seq/par flow control."));
                         }
                     }
 
-                    if (m.hasLoops) {
-                        coordFailed = true;
-                        diagnostics.add(createDiag(m.range, "Petra Coord: Raw while/for loops are forbidden. Use sep/seq/par flow control."));
+                    // 2. @BASE SPECIFIC RULES (Strict OOP State/Memory Constraints)
+                    if (m.isBase) {
+                        if (m.hasExceptions) {
+                            baseFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Base: Exceptions are forbidden."));
+                        }
+                        if (m.hasUntyped) {
+                            baseFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Base: Explicit types required. Type inference is forbidden."));
+                        }
+                        if (!m.returnsPrimitive) {
+                            baseFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Base: Methods can only return primitives or void."));
+                        }
+                        if (m.isEntry && m.hasParams) {
+                            baseFailed = true;
+                            diagnostics.add(createDiag(m.range, "Petra Base: Entry points must have 0 parameters."));
+                        }
+
+                        for (UVar v : m.locals) {
+                            if (!v.isPrimitive && !v.isFinal) {
+                                baseFailed = true;
+                                diagnostics.add(createDiag(v.range, "Petra Base: Local variables and parameters must be primitives or strictly final object references."));
+                            }
+                        }
                     }
                 }
             }
 
-            if (!baseFailed && !coordFailed) {
-                diagnostics.add(createTag("System Tag: \u2714 Petra Coord Compliant (Inherently Base Compliant)"));
-            } else if (!baseFailed) {
-                diagnostics.add(createTag("System Tag: \u2714 Petra Base Compliant (Fails stricter Coord constraints due to raw loops)"));
-            } else {
-                diagnostics.add(createTag("System Tag: \u274C Non-Compliant (Violates core Petra Base OOP subsets)"));
+            if (isAnyBase && isAnyCoord) {
+                if (!baseFailed && !coordFailed) diagnostics.add(createTag("System Tag: \u2714 Petra Coord+Base Compliant"));
+                else diagnostics.add(createTag("System Tag: \u274C Non-Compliant (Violates Petra Coord+Base constraints)"));
+            } else if (isAnyCoord) {
+                if (!coordFailed) diagnostics.add(createTag("System Tag: \u2714 Petra Coord Compliant"));
+                else diagnostics.add(createTag("System Tag: \u274C Non-Compliant (Violates Petra Coord constraints)"));
+            } else if (isAnyBase) {
+                if (!baseFailed) diagnostics.add(createTag("System Tag: \u2714 Petra Base Compliant"));
+                else diagnostics.add(createTag("System Tag: \u274C Non-Compliant (Violates Petra Base constraints)"));
             }
 
         } catch (Exception e) {
@@ -591,14 +667,12 @@ public class PetraUniversalLSP implements LanguageServer, TextDocumentService, W
         if (uri == null) return false;
         String lowerUri = uri.toLowerCase();
 
-        // 1. Directory-based heuristics (Maven/Gradle, Python, JS/TS)
         if (lowerUri.contains("/src/test/") ||
                 lowerUri.contains("/tests/") ||
                 lowerUri.contains("/__tests__/")) {
             return true;
         }
 
-        // 2. File-name-based heuristics
         if (lowerUri.endsWith("test.java") || lowerUri.endsWith("tests.java") ||
                 lowerUri.endsWith("_test.go") || lowerUri.endsWith("_test.py") ||
                 lowerUri.endsWith("_test.cpp") || lowerUri.endsWith("_test.rs") ||
